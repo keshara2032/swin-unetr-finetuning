@@ -23,10 +23,11 @@ Single-modality 2D slices are repeated to 4 channels and stacked to a small dept
 # MLIA training/testing quickstart
 - Finetune on MLIA (single GPU):  
   ```bash
-  python main.py --data_dir=../../Data/Segmentation_data/ \
-    --pretrained_dir=./pretrained_models/ --pretrained_model_name=<model.pt> \
-    --logdir=mlia_run --save_checkpoint --val_every=5 --noamp --use_checkpoint \
-    --roi_x=96 --roi_y=96 --roi_z=32 --pseudo_3d_depth=32 --in_channels=4 --out_channels=3
+  python main.py --data_dir=/standard/mlia/Team_9/Segmentation_data     --pretrained_dir=./pretrained_models --pretrained_model_name=./fold1_f48_ep300_4gpu_dice0_9059/model.pt --logdir=mlia_run --save_checkpoint --val_every=5 --noamp --use_checkpoint --roi_x=96 --roi_y=96 --roi_z=32 --pseudo_3d_depth=32 --in_channels=4 --out_channels=3
+  ```
+- Finetune on MLIA (multi GPU):  
+  ```bash
+  python main.py --data_dir=/standard/mlia/Team_9/Segmentation_data --distributed --pretrained_dir=./pretrained_models --pretrained_model_name=./fold1_f48_ep300_4gpu_dice0_9059/model.pt --logdir=mlia_run --save_checkpoint --val_every=5 --noamp --use_checkpoint --roi_x=96 --roi_y=96 --roi_z=32 --pseudo_3d_depth=32 --in_channels=4 --out_channels=3
   ```
 - Inference on MLIA test/val:  
   ```bash

@@ -30,6 +30,10 @@ from monai.networks.nets import SwinUNETR
 from monai.transforms import Activations, AsDiscrete, Compose
 from monai.utils.enums import MetricReduction
 
+from monai.losses import DiceCELoss, DiceLoss
+from monai.metrics import DiceMetric
+from monai.transforms import Activations, AsDiscrete, Compose
+
 parser = argparse.ArgumentParser(description="Swin UNETR segmentation pipeline for BRATS Challenge")
 parser.add_argument("--checkpoint", default=None, help="start training from saved checkpoint")
 parser.add_argument("--logdir", default="test", type=str, help="directory to save the tensorboard logs")
@@ -126,7 +130,7 @@ def main_worker(gpu, args):
     print(args.rank, " gpu", args.gpu)
     if args.rank == 0:
         print("Batch size is:", args.batch_size, "epochs", args.max_epochs)
-    inf_size = [args.roi_x, args.roi_y, args.roi_z]
+    inf_size = [args.roi_x, args.roi_y]
     pretrained_dir = args.pretrained_dir
     model_name = args.pretrained_model_name
     pretrained_pth = os.path.join(pretrained_dir, model_name)
@@ -144,23 +148,56 @@ def main_worker(gpu, args):
         out_channels=args.out_channels,
         feature_size=args.feature_size,
         use_checkpoint=args.use_checkpoint,
-        img_size=(args.roi_x, args.roi_y, args.roi_z),
+        img_size=(args.roi_x, args.roi_y),
+        spatial_dims=args.spatial_dims,
     )
+
+    print("Model")
+    print(model)
 
     if args.resume_ckpt:
         model_dict = torch.load(pretrained_pth)["state_dict"]
         model.load_state_dict(model_dict)
         print("Using pretrained weights")
 
+    num_classes = args.out_channels  # 4 for your setup
+
+    # Multiclass Dice + Cross-Entropy loss
     if args.squared_dice:
         dice_loss = DiceLoss(
-            to_onehot_y=False, sigmoid=True, squared_pred=True, smooth_nr=args.smooth_nr, smooth_dr=args.smooth_dr
+            to_onehot_y=True,
+            softmax=True,              # <-- use softmax for multiclass
+            squared_pred=True,
+            include_background=True,
+            smooth_nr=args.smooth_nr,
+            smooth_dr=args.smooth_dr,
         )
     else:
-        dice_loss = DiceLoss(to_onehot_y=False, sigmoid=True)
-    post_sigmoid = Activations(sigmoid=True)
-    post_pred = AsDiscrete(argmax=False, logit_thresh=0.5)
-    dice_acc = DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH, get_not_nans=True)
+        dice_loss = DiceCELoss(
+            to_onehot_y=True,          # <-- convert labels (B,1,H,W) -> (B,C,H,W)
+            softmax=True,              # <-- softmax over 4 channels
+            include_background=True,
+            smooth_nr=args.smooth_nr,
+            smooth_dr=args.smooth_dr,
+        )
+
+
+
+    # For validation / metrics: softmax + argmax + one-hot
+    post_sigmoid = Activations(softmax=True)  # keep name to avoid changing trainer signature
+    post_pred = AsDiscrete(argmax=True, to_onehot=args.out_channels)
+
+    # Labels also need to be one-hot for DiceMetric
+    post_label = AsDiscrete(to_onehot=args.out_channels)
+
+    dice_acc = DiceMetric(
+        include_background=True,
+        reduction=MetricReduction.MEAN_BATCH,
+        get_not_nans=True,
+    )
+
+
+
     model_inferer = partial(
         sliding_window_inference,
         roi_size=inf_size,
@@ -218,7 +255,7 @@ def main_worker(gpu, args):
     else:
         scheduler = None
 
-    semantic_classes = ["Dice_Val_TC", "Dice_Val_WT", "Dice_Val_ET"]
+    semantic_classes = ["Dice_BG", "Dice_C1", "Dice_C2", "Dice_C3"]
 
     accuracy = run_training(
         model=model,
@@ -233,6 +270,7 @@ def main_worker(gpu, args):
         start_epoch=start_epoch,
         post_sigmoid=post_sigmoid,
         post_pred=post_pred,
+        post_label=post_label,
         semantic_classes=semantic_classes,
     )
     return accuracy

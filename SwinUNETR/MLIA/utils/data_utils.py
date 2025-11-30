@@ -15,7 +15,6 @@ import math
 import os
 from pathlib import Path
 from typing import List, Tuple
-from functools import partial
 
 import numpy as np
 import torch
@@ -24,26 +23,9 @@ from monai import data, transforms
 from monai.data import ITKReader
 
 
-def repeat_channels(x, target_channels: int):
-    """
-    Repeat single-channel input to the desired channel count if needed.
-    """
-    if x.shape[0] == target_channels:
-        return x
-    return np.repeat(x, target_channels, axis=0)
-
-
-def add_depth(x, depth: int):
-    """
-    Ensure a depth dimension exists and matches the desired pseudo 3D depth.
-    """
-    if x.ndim == 3:
-        x = np.expand_dims(x, -1)
-    if x.shape[-1] == depth:
-        return x
-    return np.repeat(x, depth, axis=-1)
-
-
+# -------------------------------------------------------------------------
+# Distributed Sampler (unchanged)
+# -------------------------------------------------------------------------
 class Sampler(torch.utils.data.Sampler):
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, make_even=True):
         if num_replicas is None:
@@ -91,6 +73,9 @@ class Sampler(torch.utils.data.Sampler):
         self.epoch = epoch
 
 
+# -------------------------------------------------------------------------
+# JSON datalist reading (unchanged)
+# -------------------------------------------------------------------------
 def datafold_read(datalist, basedir, fold=0, key="training"):
     with open(datalist) as f:
         json_data = json.load(f)
@@ -115,6 +100,9 @@ def datafold_read(datalist, basedir, fold=0, key="training"):
     return tr, val
 
 
+# -------------------------------------------------------------------------
+# MLIA-style file pairing for your mhd/raw layout
+# -------------------------------------------------------------------------
 def _collect_mlia_pairs(split_root: Path) -> List[dict]:
     """
     Build paired file list for MLIA data layout.
@@ -164,7 +152,19 @@ def build_mlia_splits(
     return tr, val
 
 
+# -------------------------------------------------------------------------
+# Core loader builder (2D version)
+# -------------------------------------------------------------------------
 def get_loader(args):
+    """
+    Build DataLoaders for 2D single-channel brain MRI segmentation.
+
+    Assumptions:
+      - Images: 2D (H,W) grayscale slices in .mhd/.raw
+      - Labels: 2D (H,W) masks with values in {0,1,2,4}
+        (we remap 0,1,2,4 -> 0,1,2,3 for training)
+      - Model: 2D SwinUNETR with in_channels=1, out_channels=4
+    """
     data_dir = args.data_dir
     datalist_json = args.json_list
 
@@ -178,63 +178,102 @@ def get_loader(args):
 
     itk_reader = ITKReader()
 
+    # Label mapping: your raw labels use [0,1,2,4] (BraTS-style),
+    # so we map them to [0,1,2,3] to have 4 consecutive class IDs.
+    orig_labels = [0, 1, 2, 4]
+    target_labels = [0, 1, 2, 3]
+
+    # Convenience alias: 2D ROI (H,W) for crops
+    roi_size = [args.roi_x, args.roi_y]
+
+    # --------------------- TRAIN TRANSFORMS (2D) --------------------- #
     train_transform = transforms.Compose(
         [
+            # Load .mhd/.raw into numpy arrays
             transforms.LoadImaged(keys=["image", "label"], reader=itk_reader),
-            transforms.EnsureChannelFirstd(keys="image"),
-            transforms.Lambdad(keys="image", func=partial(repeat_channels, target_channels=args.in_channels)),
-            transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
-            transforms.Lambdad(keys=["image", "label"], func=partial(add_depth, depth=args.pseudo_3d_depth)),
-            transforms.Transposed(keys=["image", "label"], indices=[0, 3, 1, 2]),
-            transforms.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
+
+            # (H,W) -> (1,H,W) for both image and label
+            transforms.EnsureChannelFirstd(keys=["image", "label"]),
+
+            # Map label values {0,1,2,4} -> {0,1,2,3}
+            transforms.MapLabelValued(
+                keys="label",
+                orig_labels=orig_labels,
+                target_labels=target_labels,
+            ),
+
+            # Normalize MRI intensities per channel, using non-zero voxels
+            transforms.NormalizeIntensityd(
+                keys="image", nonzero=True, channel_wise=True
+            ),
+
+            # Random 2D crops around positive/negative label regions
             transforms.RandCropByPosNegLabeld(
                 keys=["image", "label"],
                 label_key="label",
-                spatial_size=[args.roi_z, args.roi_x, args.roi_y],
+                spatial_size=roi_size,  # [H,W]
                 pos=1,
                 neg=1,
                 num_samples=1,
-                image_threshold=0,
-                allow_smaller=True,
+                image_threshold=0.0,
             ),
+
+            # 2D flips (H and W) for data augmentation
             transforms.RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             transforms.RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-            transforms.RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-            transforms.RandScaleIntensityd(keys="image", factors=0.1, prob=args.RandScaleIntensityd_prob),
-            transforms.RandShiftIntensityd(keys="image", offsets=0.1, prob=args.RandShiftIntensityd_prob),
-            transforms.Lambdad(keys=["image", "label"], func=np.ascontiguousarray),
+
+            # Optional rotation augmentation
+            transforms.RandRotate90d(
+                keys=["image", "label"],
+                prob=0.5,
+                max_k=3,
+            ),
+
+            # Intensity augmentations to improve robustness
+            transforms.RandScaleIntensityd(
+                keys="image", factors=0.1, prob=args.RandScaleIntensityd_prob
+            ),
+            transforms.RandShiftIntensityd(
+                keys="image", offsets=0.1, prob=args.RandShiftIntensityd_prob
+            ),
+
+            # Ensure label is an integer type before tensor conversion
+            transforms.Lambdad(keys="label", func=lambda x: x.astype(np.int64)),
+
+            # Convert to PyTorch tensors
             transforms.ToTensord(keys=["image", "label"]),
         ]
     )
+
+    # --------------------- VAL / TEST TRANSFORMS (2D, NO RANDOMNESS) --------------------- #
     val_transform = transforms.Compose(
         [
             transforms.LoadImaged(keys=["image", "label"], reader=itk_reader),
-            transforms.EnsureChannelFirstd(keys="image"),
-            transforms.Lambdad(keys="image", func=partial(repeat_channels, target_channels=args.in_channels)),
-            transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
-            transforms.Lambdad(keys=["image", "label"], func=partial(add_depth, depth=args.pseudo_3d_depth)),
-            transforms.Transposed(keys=["image", "label"], indices=[0, 3, 1, 2]),
-            transforms.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            transforms.Lambdad(keys=["image", "label"], func=np.ascontiguousarray),
+            transforms.EnsureChannelFirstd(keys=["image", "label"]),
+            transforms.MapLabelValued(
+                keys="label",
+                orig_labels=orig_labels,
+                target_labels=target_labels,
+            ),
+            transforms.NormalizeIntensityd(
+                keys="image", nonzero=True, channel_wise=True
+            ),
+            # For validation, use a deterministic crop (center) to roi_size
+            transforms.CenterSpatialCropd(
+                keys=["image", "label"],
+                roi_size=roi_size,
+            ),
+            transforms.Lambdad(keys="label", func=lambda x: x.astype(np.int64)),
             transforms.ToTensord(keys=["image", "label"]),
         ]
     )
 
-    test_transform = transforms.Compose(
-        [
-            transforms.LoadImaged(keys=["image", "label"], reader=itk_reader),
-            transforms.EnsureChannelFirstd(keys="image"),
-            transforms.Lambdad(keys="image", func=partial(repeat_channels, target_channels=args.in_channels)),
-            transforms.ConvertToMultiChannelBasedOnBratsClassesd(keys="label"),
-            transforms.Lambdad(keys=["image", "label"], func=partial(add_depth, depth=args.pseudo_3d_depth)),
-            transforms.Transposed(keys=["image", "label"], indices=[0, 3, 1, 2]),
-            transforms.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            transforms.Lambdad(keys=["image", "label"], func=np.ascontiguousarray),
-            transforms.ToTensord(keys=["image", "label"]),
-        ]
-    )
+    # For test_mode, we use the same as val_transform (no randomness)
+    test_transform = val_transform
 
+    # --------------------- BUILD LOADERS --------------------- #
     if args.test_mode:
+        # If Testing/ exists, prefer that; otherwise reuse validation_files.
         if os.path.exists(Path(data_dir) / "Testing"):
             test_pairs = _collect_mlia_pairs(Path(data_dir) / "Testing")
             validation_files = test_pairs if len(test_pairs) > 0 else validation_files
@@ -243,11 +282,10 @@ def get_loader(args):
         test_loader = data.DataLoader(
             val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
         )
-
         loader = test_loader
     else:
+        # Train loader
         train_ds = data.Dataset(data=train_files, transform=train_transform)
-
         train_sampler = Sampler(train_ds) if args.distributed else None
         train_loader = data.DataLoader(
             train_ds,
@@ -257,11 +295,19 @@ def get_loader(args):
             sampler=train_sampler,
             pin_memory=True,
         )
+
+        # Validation loader
         val_ds = data.Dataset(data=validation_files, transform=val_transform)
         val_sampler = Sampler(val_ds, shuffle=False) if args.distributed else None
         val_loader = data.DataLoader(
-            val_ds, batch_size=1, shuffle=False, num_workers=args.workers, sampler=val_sampler, pin_memory=True
+            val_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.workers,
+            sampler=val_sampler,
+            pin_memory=True,
         )
+
         loader = [train_loader, val_loader]
 
     return loader

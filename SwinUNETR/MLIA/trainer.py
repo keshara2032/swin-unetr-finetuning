@@ -61,12 +61,16 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args):
                 "time {:.2f}s".format(time.time() - start_time),
             )
         start_time = time.time()
+
+        # break # only one iteration for sanity check
+
+
     for param in model.parameters():
         param.grad = None
     return run_loss.avg
 
 
-def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_sigmoid=None, post_pred=None):
+def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_sigmoid=None, post_pred=None, post_label=None):
     model.eval()
     start_time = time.time()
     run_acc = AverageMeter()
@@ -77,12 +81,24 @@ def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_sig
             data, target = data.cuda(args.rank), target.cuda(args.rank)
             with autocast(enabled=args.amp):
                 logits = model_inferer(data)
-            val_labels_list = decollate_batch(target)
-            val_outputs_list = decollate_batch(logits)
-            val_output_convert = [post_pred(post_sigmoid(val_pred_tensor)) for val_pred_tensor in val_outputs_list]
+
+
+            # decollate batch: list of tensors
+            val_labels_list = decollate_batch(target)   # each: (1,H,W), ints in {0,1,2,3}
+            val_outputs_list = decollate_batch(logits)  # each: (4,H,W), logits
+
+            # convert labels and predictions to one-hot (B=1 per element)
+            if post_label is not None:
+                val_labels_list = [post_label(y) for y in val_labels_list]       # -> (4,H,W)
+            if post_pred is not None:
+                val_outputs_list = [post_pred(y) for y in val_outputs_list]      # -> (4,H,W), one-hot from argmax
+
             acc_func.reset()
-            acc_func(y_pred=val_output_convert, y=val_labels_list)
+            acc_func(y_pred=val_outputs_list, y=val_labels_list)
             acc, not_nans = acc_func.aggregate()
+
+
+
             acc = acc.cuda(args.rank)
             if args.distributed:
                 acc_list, not_nans_list = distributed_all_gather(
@@ -94,20 +110,26 @@ def val_epoch(model, loader, epoch, acc_func, args, model_inferer=None, post_sig
                 run_acc.update(acc.cpu().numpy(), n=not_nans.cpu().numpy())
 
             if args.rank == 0:
-                Dice_TC = run_acc.avg[0]
-                Dice_WT = run_acc.avg[1]
-                Dice_ET = run_acc.avg[2]
+                Dice_BG = run_acc.avg[0]
+                Dice_C1 = run_acc.avg[1]
+                Dice_C2 = run_acc.avg[2]
+                Dice_C3 = run_acc.avg[3]
                 print(
                     "Val {}/{} {}/{}".format(epoch, args.max_epochs, idx, len(loader)),
-                    ", Dice_TC:",
-                    Dice_TC,
-                    ", Dice_WT:",
-                    Dice_WT,
-                    ", Dice_ET:",
-                    Dice_ET,
+                    ", Dice_BG:",
+                    Dice_BG,
+                    ", Dice_C1:",
+                    Dice_C1,
+                    ", Dice_C2:",
+                    Dice_C2,
+                    ", Dice_C3:",
+                    Dice_C3,
                     ", time {:.2f}s".format(time.time() - start_time),
-                )
+                )   
+                  
             start_time = time.time()
+
+            # break # only one iteration for sanity check
 
     return run_acc.avg
 
@@ -137,6 +159,7 @@ def run_training(
     start_epoch=0,
     post_sigmoid=None,
     post_pred=None,
+    post_label=None,
     semantic_classes=None,
 ):
     writer = None
@@ -179,22 +202,26 @@ def run_training(
                 args=args,
                 post_sigmoid=post_sigmoid,
                 post_pred=post_pred,
+                post_label=post_label,
             )
 
             if args.rank == 0:
-                Dice_TC = val_acc[0]
-                Dice_WT = val_acc[1]
-                Dice_ET = val_acc[2]
+                Dice_BG = val_acc[0]
+                Dice_C1 = val_acc[1]
+                Dice_C2 = val_acc[2]
+                Dice_C3 = val_acc[3]
                 print(
                     "Final validation stats {}/{}".format(epoch, args.max_epochs - 1),
-                    ", Dice_TC:",
-                    Dice_TC,
-                    ", Dice_WT:",
-                    Dice_WT,
-                    ", Dice_ET:",
-                    Dice_ET,
+                    ", Dice_BG:",
+                    Dice_BG,
+                    ", Dice_C1:",
+                    Dice_C1,
+                    ", Dice_C2:",
+                    Dice_C2,
+                    ", Dice_C3:",
+                    Dice_C3,
                     ", time {:.2f}s".format(time.time() - epoch_time),
-                )
+                )   
 
                 if writer is not None:
                     writer.add_scalar("Mean_Val_Dice", np.mean(val_acc), epoch)

@@ -99,7 +99,7 @@ def main():
 
     model_inferer_test = partial(
         sliding_window_inference,
-        roi_size=[args.roi_x, args.roi_y, args.roi_z],
+        roi_size=[args.roi_x, args.roi_y],
         sw_batch_size=1,
         predictor=model,
         overlap=args.infer_overlap,
